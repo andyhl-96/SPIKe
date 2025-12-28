@@ -132,40 +132,33 @@ def _build_constraint_rows(deg, specs, t0, t1):
         t = t0 if sel == 0 else t1
         row = [(_monomial_deriv_coeff(k, r) * (t ** (k - r) if k >= r else 0.0)) for k in range(deg + 1)]
         rows.append(row)
-    return jnp.array(rows, dtype=jnp.float64)
+    return jnp.array(rows)
 
 
-def _normalize_bc_list(bc):
-    """Convert bc inputs to list of 1D jnp arrays.
-
-    Accepts: list/tuple of arrays, or dict mapping names -> arrays (not used here but supported).
-    """
-    if isinstance(bc, dict):
-        vals = list(bc.values())
-    else:
-        vals = list(bc)
-    out = [jnp.ravel(jnp.asarray(v, dtype=jnp.float64)) for v in vals]
-    return out
-
-
+@jax.jit
 def compute_hermite_poly4(bc, t0, t1):
-    """Compute quartic (degree 4) Hermite interpolant.
+    """Compute quartic (degree 4) Hermite interpolant (JIT-friendly).
 
-    Expected `bc` ordering (5 items):
-      [p0, p1, v0, v1, a0]
-    where p=position, v=velocity (1st derivative), a=acceleration (2nd derivative),
-    and each item is a row vector (1D array) with one entry per DOF.
-
-    Returns:
-      coeffs: jnp array of shape (5, n_dof) with monomial coefficients [c0, c1, ..., c4]
-      eval_poly: function t -> (len(t), n_dof) evaluated on input times (scalar or 1D array)
+    `bc` should be an iterable of 5 row-vectors (p0, p1, v0, v1, a0), each of
+    shape (n_dof,) or a single 2D array of shape (5, n_dof). Returns ``coeffs``
+    with shape (5, n_dof). Use ``eval_hermite_poly(coeffs, t)`` to evaluate the
+    polynomial at scalar or array times ``t`` (this evaluator is JIT-compiled).
     """
     deg = 4
-    bc_list = _normalize_bc_list(bc)
-    if len(bc_list) != deg + 1:
-        raise ValueError(f"compute_hermite_poly4 expects {deg+1} boundary conditions (p0, p1, v0, v1, a0); got {len(bc_list)}")
 
-    # constraints: (time_selector, derivative_order)
+    # stack into (5, n_dof)
+    B = jnp.asarray(bc)
+    if B.ndim == 1:
+        # single DOF and bc provided as flat vector
+        B = B[:, None]
+    # ensure shape
+    if B.shape[0] != deg + 1:
+        # maybe user passed shape (n_dof, 5)
+        if B.shape[1] == deg + 1:
+            B = B.T
+        else:
+            raise ValueError(f"compute_hermite_poly4 expects {deg+1} boundary conditions (p0,p1,v0,v1,a0); got shape {B.shape}")
+
     specs = [(0, 0),  # p(t0)
              (1, 0),  # p(t1)
              (0, 1),  # p'(t0)
@@ -174,32 +167,30 @@ def compute_hermite_poly4(bc, t0, t1):
 
     A = _build_constraint_rows(deg, specs, t0, t1)  # shape (5,5)
 
-    B = jnp.stack(bc_list, axis=0)  # shape (5, n_dof)
-
-    # solve linear system for coefficients for all dofs at once
     coeffs = jnp.linalg.solve(A, B)  # shape (5, n_dof)
 
-    def eval_poly(t):
-        t_a = jnp.atleast_1d(t)
-        powers = jnp.stack([t_a ** k for k in range(deg + 1)], axis=1)  # (nt, deg+1)
-        return powers @ coeffs
-
-    return coeffs, eval_poly
+    return coeffs
 
 
+@jax.jit
 def compute_hermite_poly5(bc, t0, t1):
-    """Compute quintic (degree 5) Hermite interpolant.
+    """Compute quintic (degree 5) Hermite interpolant (JIT-friendly).
 
-    Expected `bc` ordering (6 items):
-      [p0, p1, v0, v1, a0, a1]
-    where p=position, v=velocity, a=acceleration; each item is a row vector per DOF.
-
-    Returns (coeffs, eval_poly) analogous to `compute_hermite_poly4`.
+    `bc` should be an iterable of 6 row-vectors (p0, p1, v0, v1, a0, a1), each of
+    shape (n_dof,) or a single 2D array of shape (6, n_dof). Returns ``coeffs``
+    with shape (6, n_dof). Use ``eval_hermite_poly(coeffs, t)`` to evaluate the
+    polynomial at scalar or array times ``t`` (this evaluator is JIT-compiled).
     """
     deg = 5
-    bc_list = _normalize_bc_list(bc)
-    if len(bc_list) != deg + 1:
-        raise ValueError(f"compute_hermite_poly5 expects {deg+1} boundary conditions (p0, p1, v0, v1, a0, a1); got {len(bc_list)}")
+
+    B = jnp.asarray(bc)
+    if B.ndim == 1:
+        B = B[:, None]
+    if B.shape[0] != deg + 1:
+        if B.shape[1] == deg + 1:
+            B = B.T
+        else:
+            raise ValueError(f"compute_hermite_poly5 expects {deg+1} boundary conditions (p0,p1,v0,v1,a0,a1); got shape {B.shape}")
 
     specs = [(0, 0),  # p(t0)
              (1, 0),  # p(t1)
@@ -210,16 +201,24 @@ def compute_hermite_poly5(bc, t0, t1):
 
     A = _build_constraint_rows(deg, specs, t0, t1)  # (6,6)
 
-    B = jnp.stack(bc_list, axis=0)  # (6, n_dof)
-
     coeffs = jnp.linalg.solve(A, B)  # (6, n_dof)
 
-    def eval_poly(t):
-        t_a = jnp.atleast_1d(t)
-        powers = jnp.stack([t_a ** k for k in range(deg + 1)], axis=1)  # (nt, deg+1)
-        return powers @ coeffs
+    return coeffs
 
-    return coeffs, eval_poly
+
+@jax.jit
+def eval_hermite_poly(coeffs, t):
+    """Evaluate monomial Hermite polynomial(s) given ``coeffs`` at times ``t``.
+
+    ``coeffs`` shape: (deg+1, n_dof). ``t`` may be scalar or 1D array. Returns
+    an array with shape (nt, n_dof) (nt=1 for scalar).
+    """
+    coeffs = jnp.asarray(coeffs)
+    t_a = jnp.atleast_1d(t)
+    degp1 = coeffs.shape[0]
+    # build powers (nt, deg+1)
+    powers = jnp.stack([t_a ** k for k in range(degp1)], axis=1)
+    return powers @ coeffs
 
 # measure difference between computed path and true path
 def compute_cost():

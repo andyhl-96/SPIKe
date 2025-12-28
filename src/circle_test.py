@@ -51,10 +51,8 @@ tf = time.perf_counter()
 print(tf - ts)
 
 print([layers[0][0], layers[1][0], np.zeros(7), np.zeros(7)])
-coeffs, poly = spike.compute_hermite_poly4([layers[0][0], layers[1][0], np.zeros(7), np.zeros(7), np.zeros(7)], 0.0, 0.1)
+coeffs = spike.compute_hermite_poly4([layers[0][0], layers[1][0], jnp.zeros(7), jnp.zeros(7), jnp.zeros(7)], 0.0, 0.1)
 print(coeffs)
-print(poly(0))
-print(poly(0.1))
 exit()
 
 while True:
