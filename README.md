@@ -1,1 +1,1 @@
-# SPIKe: Stein-Variational Pathwise Inverse Kinematics
+# SEPTIK: Stein-Enhanced Pathwise Inverse Kinematics
