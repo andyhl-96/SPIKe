@@ -12,14 +12,14 @@ def circle(t, T):
     return x
 
 # sample poses on the path
-path_nodes = septik.compute_points(circle, 20, 50)
+path_nodes = septik.compute_points(circle, 5, 100)
 
 # project points on each IK manifold
 franka_urdf, franka, franka_coll = septik.load_robot("fr3_franka_hand.urdf")
-X = septik.sample(septik.primes[0:7], jnp.arange(1, 51))
+X = septik.sample(septik.primes[0:7], jnp.arange(1, 11))
 X = septik.scale_points(X, franka.joints.lower_limits_all[0:7], franka.joints.upper_limits_all[0:7])
-print(franka.joints.upper_limits_all[0:7])
-print(septik.primes[0:7])
+# print(franka.joints.upper_limits_all[0:7])
+# print(septik.primes[0:7])
 
 # initialize viser with robot and IK path
 server = viser.ViserServer()
@@ -52,7 +52,7 @@ print("(SEPTIK) Done jitting")
 layers = []
 ts = time.perf_counter()
 for i in range(len(path_nodes)):
-    X_proj = septik.jacobi_stein_proj(ik_funcs[i], 10, 10, X, franka)
+    X_proj = septik.jacobi_stein_proj(ik_funcs[i], 10, 25, X, franka)
     layers.append(X_proj)
 tf = time.perf_counter()
 print(tf - ts)
