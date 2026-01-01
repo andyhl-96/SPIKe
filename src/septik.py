@@ -6,6 +6,7 @@ import yourdfpy
 import pyroki as pk
 import numpy as np
 from jax.scipy.special import factorial
+import time
 
 primes = jnp.array([
         2,
@@ -43,7 +44,7 @@ def load_robot(urdf_path):
     return urdf, robot, robot_coll
 
 def compute_points(func, T, num):
-    ts = jnp.linspace(0, 1, num)
+    ts = jnp.linspace(0, T, num)
     bat_func = jax.vmap(func, in_axes=(0, None))
     return bat_func(ts, T)
 
@@ -81,8 +82,8 @@ def stein_proj(f, k, X, robot):
     # X_k = X
     def loop1(i, X_k):
         update_batch = jax.vmap(update, in_axes=(None, 0))
-        X_del = update_batch(X_k, X_k)
-        return X_k + 1 / n * X_del
+        X_del = update_batch(X_k, X_k) / n
+        return X_k + jnp.log2(n) / n * X_del
     initial = X
     X_k = jax.lax.fori_loop(0, k, loop1, initial)
     return X_k
@@ -92,7 +93,7 @@ def jacobi_stein_proj(f, outer, inner, X, robot):
     jacobi_batch = jax.vmap(jacobi_proj, in_axes=(None, None, 0, None))
     def loop(i, proj):
         proj = stein_proj(f, inner, proj, robot)
-        proj = jacobi_batch(f, inner, proj, robot)
+        proj = jacobi_batch(f, 2 * inner, proj, robot)
         return proj
     X_k = jax.lax.fori_loop(0, outer, loop, X)
     return X_k
@@ -100,29 +101,39 @@ def jacobi_stein_proj(f, outer, inner, X, robot):
 def find_best_sequence(layers, T, f, robot, num_points):
     # T[i, j] minimum cost to get to layer i node j
     # T[i, j] = min over k {T[i - 1, k] + c(k, j)}
-    delta_t = T / (len(layers) - 1)
-    def compute_candidates(i, j, T):
-        t0 = (i - 1) * delta_t
-        t1 = i * delta_t
-        # need bc for all polys
-        bcs = []
-        for x in range(len(layers[0])):
-            for y in range(len(layers[0])):
-                bcs.append([layers[i - 1][x], layers[i][y], ])
-        cands = jnp.zeros(len(layers[0]))
-        if i == len(layers) - 1:
-            coeffs = compute_hermite_poly5(bc, t0, t1)
-        else:
-            coeffs = compute_hermite_poly4(bc, t0, t1)
-        cands += T[i - 1, :] + compute_cost(coeffs, f, robot, num_points, t0, t1, T)
+    ts = np.linspace(0, T, len(layers))
+    dof = len(layers[0][0])
+    poly5_batch = jax.vmap(compute_hermite_poly5, in_axes=(0, None, None))
+    batch_cost = jax.vmap(compute_cost, in_axes=(0, None, None, None, None, None, None))
+    def compute_candidates(i, j, C):
+        t0 = ts[i - 1]
+        t1 = ts[i]
+        delta_t = t1 - t0
+        # vectorized construction of boundary conditions for all nodes in previous layer
+        # p0s: (n_nodes, dof), p1: (dof,)
+        p0s = jnp.asarray(layers[i - 1])
+        p1 = jnp.asarray(layers[i][j])
+        n_nodes = p0s.shape[0]
+        zeros = jnp.zeros((n_nodes, dof))
+        p1s = jnp.broadcast_to(p1, (n_nodes, dof))
+        # stack into shape (n_nodes, 6, dof): [p0, p1, v0, v1, a0, a1]
+        bcs = jnp.stack([p0s, p1s, zeros, zeros, zeros, zeros], axis=1)
+
+        polys_i = poly5_batch(bcs, 0, delta_t)
+        cands = C[i - 1, :] + batch_cost(polys_i, f, robot, num_points, t0, t1, T)
         return cands
-    T = jnp.ones((len(layers)), len(layers[0])) * jnp.inf
-    T[0, :] = 0
+    C = np.ones(((len(layers)), len(layers[0]))) * np.inf
+    C[0, :] = 0
+    BT = np.ones(((len(layers)), len(layers[0]))) * -1
     for i in range(1, len(layers)):
+        # vectorize over configs
         for j in range(len(layers[0])):
-            cands = compute_candidates(i, j, T)
+            cands = compute_candidates(i, j, C)
             min = jnp.min(cands)
-            T[i, j] = min
+            argmin = jnp.argmin(cands)
+            C[i, j] = min
+            BT[i, j] = argmin
+    return C, BT
 
 # number of boundary_conds should completely determine hermite poly of degree deg
 def _monomial_deriv_coeff(k, r):
@@ -220,7 +231,7 @@ def compute_hermite_poly5(bc, t0, t1):
     return coeffs
 
 
-# @partial(jax.jit, static_argnames=['order'])
+@partial(jax.jit, static_argnames=['order'])
 def eval_hermite_poly(coeffs, t, order):
     """Evaluate monomial Hermite polynomial(s) given ``coeffs`` at times ``t``.
 
@@ -245,11 +256,35 @@ def eval_hermite_poly(coeffs, t, order):
 
 # measure difference between computed path and true path
 def compute_cost(coeffs, f, robot, num_points, t0, t1, T):
-    error = 0
     times = np.linspace(t0, t1, num_points)
-    for i in range(num_points):
-        q = eval_hermite_poly(coeffs, times[i])
+    def compute_cost_pointwise(coeffs, f, robot, t, T):
+        q = eval_hermite_poly(coeffs, t - t0, 0)
         ee_pose_pred = robot.forward_kinematics(q)
-        ee_pose_true = f(times[i], T)
-        error += jnp.linalg.norm(ee_pose_true - ee_pose_pred)
-    return error
+        ee_pose_true = f(t, T)
+        error = jnp.linalg.norm(ee_pose_true - ee_pose_pred)
+        return error
+    
+    compute_cost_batch = jax.vmap(compute_cost_pointwise, in_axes=(None, None, None, 0, None))
+    return jnp.sum(compute_cost_batch(coeffs, f, robot, times, T))
+
+def compute_path(layers, f, robot, T):
+    C, BT = find_best_sequence(layers, T, f, robot, 32)
+    waypts = []
+    smooth_path = []
+    ts = np.linspace(0, T, len(layers))
+    # print(BT)
+    i = len(layers) - 1
+    argmin = int(np.argmin(C[i]))
+    waypts.append(layers[i][argmin])
+    i -= 1
+    while i >= 0:
+        waypts.append(layers[i][argmin])
+        argmin = int(BT[i, argmin])
+        i -= 1
+    waypts.reverse()
+    for i in range(len(waypts) - 1):
+        bc = [waypts[i], waypts[i + 1], np.zeros(len(waypts[0])), np.zeros(len(waypts[0])), np.zeros(len(waypts[0])), np.zeros(len(waypts[0]))]
+        coeffs = compute_hermite_poly5(bc, 0, ts[i + 1] - ts[i])
+        for t in range(0, int(1000 * (ts[i + 1] - ts[i]))):
+            smooth_path.append(eval_hermite_poly(coeffs, t / 1000, 0)[0])
+    return waypts, smooth_path

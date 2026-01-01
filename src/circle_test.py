@@ -8,15 +8,15 @@ import pyroki as pk
 import time
 
 def circle(t, T):
-    x = jnp.array([0.000000, 0.707107, 0.000000, 0.707107, 0.4, 0.2 * jnp.sin(t / T * 2 * jnp.pi), 0.2 * jnp.cos(t / T * 2 * jnp.pi) + 0.80])
+    x = jnp.array([0.000000, 0.707107, 0.000000, 0.707107, 0.6, 0.2 * jnp.sin(t / T * 2 * jnp.pi), 0.2 * jnp.cos(t / T * 2 * jnp.pi) + 0.60])
     return x
 
 # sample poses on the path
-path_nodes = septik.compute_points(circle, 5, 5)
+path_nodes = septik.compute_points(circle, 20, 50)
 
 # project points on each IK manifold
 franka_urdf, franka, franka_coll = septik.load_robot("fr3_franka_hand.urdf")
-X = septik.sample(septik.primes[0:7], jnp.arange(1, 1001))
+X = septik.sample(septik.primes[0:7], jnp.arange(1, 51))
 X = septik.scale_points(X, franka.joints.lower_limits_all[0:7], franka.joints.upper_limits_all[0:7])
 print(franka.joints.upper_limits_all[0:7])
 print(septik.primes[0:7])
@@ -34,13 +34,20 @@ server.scene.add_point_cloud(
 )
 
 # project configs onto each ik pose
-print("jitting functions")
+print("(SEPTIK) Jitting functions")
 ik_funcs = []
+print("Layer: ", end=" ", flush = True)
 for i in range(len(path_nodes)):
+    if (np.log10(i + 1)) % 1 == 0:
+        space = " " * int(np.log10(i + 1))
+        print(f"{space}", end="", flush = True)
     ik_func = lambda q, robot: jnp.linalg.norm(jnp.array(robot.forward_kinematics(q)[-1] - path_nodes[i]))
     X_proj = septik.jacobi_stein_proj(ik_func, 1, 1, X, franka)
     ik_funcs.append(ik_func)
-print("Done jitting")
+    back = "\b" * (int(np.log10(i + 1)) + 1)
+    print(f"{back}{i + 1}", end="", flush = True)
+print()
+print("(SEPTIK) Done jitting")
 
 layers = []
 ts = time.perf_counter()
@@ -50,22 +57,13 @@ for i in range(len(path_nodes)):
 tf = time.perf_counter()
 print(tf - ts)
 
-coeffs = septik.compute_hermite_poly4([layers[0][0], layers[1][0], jnp.zeros(7), jnp.zeros(7), jnp.zeros(7)], 0.0, 1)
-ts = time.perf_counter()
-coeffs = septik.compute_hermite_poly4([layers[0][0], layers[1][0], jnp.zeros(7), jnp.zeros(7), jnp.zeros(7)], 0.0, 1)
-tf = time.perf_counter()
-septik.eval_hermite_poly(coeffs, 1.0, 0)
-print(tf - ts)
-
-print(coeffs)
-print(septik.eval_hermite_poly(coeffs, 1.0, 0))
-print(layers[1][0])
-exit()
-
+print("(SEPTIK) Computing path")
+waypts, path = septik.compute_path(layers, circle, franka, 5)
+print("(SEPTIK) Path found")
 while True:
-    for layer in layers:
-        urdf_vis.update_cfg(np.array(layer[50]))
-        time.sleep(0.1)
+    for q in path:
+        urdf_vis.update_cfg(np.array(q))
+        time.sleep(0.001)
     time.sleep(1)
 
 
